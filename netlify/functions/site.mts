@@ -1,10 +1,11 @@
 import type { Config } from "@netlify/functions";
-import { eq } from "drizzle-orm";
+import { and, eq } from "drizzle-orm";
 import { database } from "../../db/index.js";
 import { jobs, profiles } from "../../db/schema.js";
 import { api } from "../../server/api.js";
-import { defaultSettings } from "../../server/content.js";
-import { accountData, publicJobs, requireActor, RequestError, siteSettings, uuidPattern } from "../../server/data.js";
+import { defaultSettings, hasIncompleteInformation, recruitmentAllowed, validationAccess } from "../../server/content.js";
+import { providedLegalDocuments } from "../../server/legal-content.js";
+import { accountData, adminAccounts, publicJobs, requireActor, RequestError, siteSettings, uuidPattern } from "../../server/data.js";
 import { dashboard } from "../../server/dashboard.js";
 import { activeJob, escapeHtml, home, jobCard, jobPage, layout, listing } from "../../server/html.js";
 import { about, authentication, legalPage, passwordPage, recruiters } from "../../server/pages.js";
@@ -44,8 +45,9 @@ export default async function site(request: Request) {
       body = listing(await publicJobs(values), values, settings);
     } else if (path.startsWith("/offres/")) {
       const id = path.slice("/offres/".length);
-      const [job] = uuidPattern.test(id) ? await database().select().from(jobs).where(eq(jobs.id, id)) : [];
-      if (!job || job.status === "pending" || job.status === "rejected") {
+      const [job] = uuidPattern.test(id) ? await database().select().from(jobs).where(and(eq(jobs.id, id), eq(jobs.validationOnly, false))) : [];
+      const [owner] = job ? await database().select({ suspended: profiles.suspended }).from(profiles).where(eq(profiles.id, job.ownerId)) : [];
+      if (!job || !owner || owner.suspended || job.status === "pending" || job.status === "rejected") {
         status = 404;
         noindex = true;
         title = "Offre introuvable — Wutligey";
@@ -59,6 +61,23 @@ export default async function site(request: Request) {
         title = `${job.title} — ${job.company}, ${job.city} | Wutligey`;
         description = `${job.company} recrute : ${job.title} à ${job.city}, Sénégal (${job.contract}). ${job.description.slice(0, 100)}`;
         body = jobPage(job, settings);
+      }
+    } else if (path === "/recette" || path.startsWith("/recette/offres/")) {
+      privatePage = true;
+      noindex = true;
+      const actor = await requireActor();
+      if (!actor.admin && !validationAccess(settings, actor.user.email)) throw new RequestError(403, "La recette privée est réservée aux comptes autorisés.");
+      title = "Recette privée — WutLigey";
+      if (path === "/recette") {
+        const offers = await publicJobs(undefined, 200, undefined, true);
+        body = `<div class="wrap"><h1>Recette privée</h1><p class="notice">Ces offres de validation ne sont pas publiques. Utilisez uniquement des données autorisées. L’ouverture publique reste indépendante.</p><p><a href="/compte">Mon espace</a></p><div class="grid">${offers.map(jobCard).join("") || "<p>Aucune offre de recette validée pour le moment.</p>"}</div></div>`;
+      } else {
+        const id = path.slice("/recette/offres/".length);
+        const [job] = uuidPattern.test(id) ? await database().select().from(jobs).where(and(eq(jobs.id, id), eq(jobs.validationOnly, true))) : [];
+        const [owner] = job ? await database().select({ suspended: profiles.suspended }).from(profiles).where(eq(profiles.id, job.ownerId)) : [];
+        if (!job || !owner || owner.suspended || job.status !== "published") throw new RequestError(404, "Offre de recette introuvable.");
+        if (!activeJob(job)) throw new RequestError(410, "Cette offre de recette est expirée.");
+        body = jobPage(job, settings, !actor.admin && validationAccess(settings, actor.user.email));
       }
     } else if (path.startsWith("/entreprises/")) {
       const ownerId = path.slice("/entreprises/".length);
@@ -84,12 +103,13 @@ export default async function site(request: Request) {
       description = "Comment fonctionne Wutligey au Sénégal ? Retrouvez les réponses sur les candidatures, la gratuité, la confidentialité des CV et la publication d’offres.";
       body = about(settings);
     } else if (["/mentions-legales", "/confidentialite", "/conditions"].includes(path)) {
-      const documents = { "/mentions-legales": ["Mentions légales", settings.legal], "/confidentialite": ["Confidentialité", settings.privacy], "/conditions": ["Conditions d’utilisation", settings.terms] };
+      const documents = { "/mentions-legales": ["Mentions légales", settings.legal || providedLegalDocuments.legal], "/confidentialite": ["Politique de confidentialité", settings.privacy || providedLegalDocuments.privacy], "/conditions": ["Conditions générales d’utilisation", settings.terms || providedLegalDocuments.terms] };
       const [label, text] = documents[path as keyof typeof documents];
       title = `${label} — Wutligey`;
       description = `${label} du service Wutligey, plateforme d’emploi au Sénégal.`;
-      noindex = preview || !text;
-      body = legalPage(label, text);
+      const draft = !settings.documentsApproved || hasIncompleteInformation(text);
+      noindex = preview || draft;
+      body = legalPage(label, text, draft);
     } else if (path === "/connexion" || path === "/inscription") {
       privatePage = true;
       const signup = path === "/inscription";
@@ -103,8 +123,10 @@ export default async function site(request: Request) {
       privatePage = true;
       const actor = await requireActor();
       const data = await accountData(actor);
+      const page = Math.min(10000, Math.max(1, Number.parseInt(url.searchParams.get("page") ?? "1", 10) || 1));
+      const accounts = actor.admin ? await adminAccounts(page) : [];
       title = "Mon espace privé — Wutligey";
-      body = dashboard(actor.profile, data.jobList, data.applicationList, settings, actor.admin);
+      body = dashboard(actor.profile, data.jobList, data.applicationList, settings, actor.admin, accounts, page, recruitmentAllowed(settings, actor.user.email), validationAccess(settings, actor.user.email));
     } else {
       status = 404;
       noindex = true;
@@ -116,12 +138,13 @@ export default async function site(request: Request) {
   } catch (error) {
     if (error instanceof RequestError && error.status === 401) return new Response(null, { status: 303, headers: { Location: "/connexion", "Cache-Control": "private, no-store", "X-Robots-Tag": "noindex" } });
     const status = error instanceof RequestError ? error.status : 503;
-    const body = `<div class="wrap prose"><h1>${status === 403 ? "Confirmation nécessaire" : "Le service est temporairement indisponible"}</h1><p>${status === 403 ? "Confirmez votre adresse e-mail avant d’ouvrir votre espace." : "Wutligey prépare les offres d’emploi au Sénégal. Les données ne peuvent pas être chargées pour le moment. Réessayez dans quelques instants."}</p><a class="btn o" href="/">Revenir à l’accueil</a></div>`;
+    if (!(error instanceof RequestError)) console.error("page_data_unavailable", { path });
+    const body = `<div class="wrap prose"><h1>${status === 403 ? "Accès non autorisé" : "Le service est temporairement indisponible"}</h1><p>${error instanceof RequestError ? escapeHtml(error.message) : "Les données ne peuvent pas être chargées pour le moment. Réessayez dans quelques instants."}</p><a class="btn o" href="/">Revenir à l’accueil</a></div>`;
     return htmlResponse(request.method === "HEAD" ? "" : layout({ title: "Wutligey — Service indisponible", description: "Plateforme d’emploi au Sénégal.", path, origin: url.origin, body, settings: defaultSettings, noindex: true }), status, true);
   }
 }
 
 export const config: Config = {
-  path: ["/", "/offres", "/stages", "/offres/:id", "/entreprises/:id", "/tarifs", "/a-propos", "/mentions-legales", "/confidentialite", "/conditions", "/connexion", "/inscription", "/mot-de-passe", "/compte", "/api/*"],
+  path: ["/", "/offres", "/stages", "/offres/:id", "/entreprises/:id", "/recette", "/recette/offres/:id", "/tarifs", "/a-propos", "/mentions-legales", "/confidentialite", "/conditions", "/connexion", "/inscription", "/mot-de-passe", "/compte", "/api/*"],
   preferStatic: false,
 };

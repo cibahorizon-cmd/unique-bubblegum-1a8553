@@ -17,12 +17,18 @@ document.addEventListener("submit", async (event) => {
   form.setAttribute("aria-busy", "true");
   showStatus(form, "Envoi en cours…");
   try {
+    const formData = new FormData(form);
+    const file = formData.get("cvFile");
+    if (file instanceof File && file.size > 3 * 1024 * 1024) {
+      showStatus(form, "Choisissez un CV PDF de 3 Mo maximum.", true);
+      return;
+    }
     const response = await fetch(form.dataset.api, {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
+      headers: form.enctype === "multipart/form-data" ? {} : { "Content-Type": "application/json" },
       credentials: "same-origin",
-      body: JSON.stringify(Object.fromEntries(new FormData(form))),
-      signal: AbortSignal.timeout(20000),
+      body: form.enctype === "multipart/form-data" ? formData : JSON.stringify(Object.fromEntries(formData)),
+      signal: AbortSignal.timeout(55000),
     });
     const result = await response.json();
     if (!response.ok) {
