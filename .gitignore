@@ -1,0 +1,7 @@
+node_modules/
+.netlify/*
+!.netlify/features/
+!.netlify/results.md
+.env
+.env.*
+!.env.example
